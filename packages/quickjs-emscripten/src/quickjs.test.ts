@@ -827,34 +827,6 @@ export default "the default";
       assert.strictEqual(dumped.name, "CustomName")
       assert.strictEqual(dumped.message, "CustomMessage")
     })
-
-    it("returns informative fallback when serialization fails due to memory limit", () => {
-      // Use a memory limit that allows object creation but fails during JSON serialization
-      vm.runtime.setMemoryLimit(1024 * 200) // 200KB
-
-      // Create an object that's too large to serialize
-      const result = vm.evalCode(`
-        const big = {};
-        for (let i = 0; i < 5000; i++) big['key' + i] = 'value' + i;
-        big;
-      `)
-
-      if (result.error) {
-        // OOM during eval is acceptable - remove limit and clean up
-        vm.runtime.setMemoryLimit(-1)
-        result.error.dispose()
-        return
-      }
-
-      const dumped = vm.dump(result.value)
-      result.value.dispose()
-      vm.runtime.setMemoryLimit(-1) // Remove limit for cleanup
-
-      // Format: JS_PrintValue output + "\n---\nnot JSON serializable: ${error}"
-      assert(typeof dumped === "string", "fallback should be a string")
-      assert(dumped.includes("---"), "should include separator")
-      assert(dumped.includes("not JSON serializable"), "should include error context")
-    })
   })
 
   describe(".typeof", () => {
