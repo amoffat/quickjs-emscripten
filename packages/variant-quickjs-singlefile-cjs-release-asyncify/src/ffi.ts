@@ -441,6 +441,9 @@ export class QuickJSAsyncFFI {
     value: JSValuePointer | JSValueConstPointer,
   ) => number = this.module.cwrap("QTS_GetLength", "number", ["number", "number", "number"])
 
+  QTS_IsError: (ctx: JSContextPointer, value: JSValuePointer | JSValueConstPointer) => number =
+    this.module.cwrap("QTS_IsError", "number", ["number", "number"])
+
   QTS_IsEqual: (
     ctx: JSContextPointer,
     a: JSValuePointer | JSValueConstPointer,

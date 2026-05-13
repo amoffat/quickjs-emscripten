@@ -1353,39 +1353,103 @@ export class QuickJSContext
    * Returns `handle.toString()` if it cannot be serialized to JSON.
    */
   dump(handle: QuickJSHandle): any {
-    this.runtime.assertOwned(handle)
-    const type = this.typeof(handle)
+    this.runtime.assertOwned(handle);
+    const type = this.typeof(handle);
     if (type === "string") {
-      return this.getString(handle)
+      return this.getString(handle);
     } else if (type === "number") {
-      return this.getNumber(handle)
+      return this.getNumber(handle);
     } else if (type === "bigint") {
-      return this.getBigInt(handle)
+      return this.getBigInt(handle);
     } else if (type === "undefined") {
-      return undefined
+      return undefined;
+    } else if (type === "boolean") {
+      return this.getNumber(handle) !== 0;
     } else if (type === "symbol") {
-      return this.getSymbol(handle)
+      return this.getSymbol(handle);
     }
 
     // It's confusing if we dump(promise) and just get back {} because promise
     // has no properties, so dump promise state.
-    const asPromiseState = this.getPromiseState(handle)
+    const asPromiseState = this.getPromiseState(handle);
     if (asPromiseState.type === "fulfilled" && !asPromiseState.notAPromise) {
-      handle.dispose()
-      return { type: asPromiseState.type, value: asPromiseState.value.consume(this.dump) }
+      handle.dispose();
+      return {
+        type: asPromiseState.type,
+        value: asPromiseState.value.consume(this.dump),
+      };
     } else if (asPromiseState.type === "pending") {
-      handle.dispose()
-      return { type: asPromiseState.type }
+      handle.dispose();
+      return { type: asPromiseState.type };
     } else if (asPromiseState.type === "rejected") {
-      handle.dispose()
-      return { type: asPromiseState.type, error: asPromiseState.error.consume(this.dump) }
+      handle.dispose();
+      return {
+        type: asPromiseState.type,
+        error: asPromiseState.error.consume(this.dump),
+      };
     }
 
-    const str = this.memory.consumeJSCharPointer(this.ffi.QTS_Dump(this.ctx.value, handle.value))
+    // Recursively deserialize objects and arrays instead of using QTS_Dump +
+    // JSON.parse, which allows dump semantics on nested values.
+    if (type === "object") {
+      // getOwnPropertyNames returns an error for null (mirrors JS behavior:
+      // Object.getOwnPropertyNames(null) throws).
+      using propsResult = this.getOwnPropertyNames(handle);
+      if (propsResult.error) {
+        return null;
+      }
+
+      // Detect arrays via the constructor name — two cheap property reads,
+      // no VM function call needed. Then recursively dump array elements.
+      using ctor = this.getProp(handle, "constructor");
+      using ctorName = this.getProp(ctor, "name");
+      const ctorNameStr = this.getString(ctorName);
+      if (ctorNameStr === "Array") {
+        const len = this.getLength(handle) ?? 0;
+        const arr: any[] = [];
+        for (let i = 0; i < len; i++) {
+          using elem = this.getProp(handle, i);
+          arr.push(this.dump(elem));
+        }
+        return arr;
+      }
+
+      // Recursively dump enumerable own properties
+      using props = propsResult.value;
+      const obj: Record<string, any> = {};
+      const enumerableKeys = new Set<string>();
+      for (const key of props) {
+        const keyStr = this.getString(key);
+        enumerableKeys.add(keyStr);
+        using val = this.getProp(handle, key);
+        obj[keyStr] = this.dump(val);
+      }
+
+      // For Error objects, also extract non-enumerable error properties
+      // (name, message, stack, etc.) that getOwnPropertyNames wouldn't include.
+      const isError = this.ffi.QTS_IsError(this.ctx.value, handle.value) === 1;
+      if (isError) {
+        for (const propName of ["name", "message", "stack", "fileName", "lineNumber"]) {
+          if (!enumerableKeys.has(propName)) {
+            using val = this.getProp(handle, propName);
+            if (this.typeof(val) !== "undefined") {
+              obj[propName] = this.dump(val);
+            }
+          }
+        }
+      }
+
+      return obj;
+    }
+
+    // Fallback for any unrecognised type.
+    const str = this.memory.consumeJSCharPointer(
+      this.ffi.QTS_Dump(this.ctx.value, handle.value),
+    );
     try {
-      return JSON.parse(str)
-    } catch (err) {
-      return str
+      return JSON.parse(str);
+    } catch {
+      return str;
     }
   }
 

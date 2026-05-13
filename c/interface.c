@@ -1230,6 +1230,14 @@ typedef enum IsEqualOp {
   QTS_EqualOp_SameValueZero = 2,
 } IsEqualOp;
 
+int QTS_IsError(JSContext *ctx, JSValueConst *value) {
+#ifdef QTS_USE_QUICKJS_NG
+  return JS_IsError(*value);
+#else
+  return JS_IsError(ctx, *value);
+#endif
+}
+
 int QTS_IsEqual(JSContext *ctx, JSValueConst *a, JSValueConst *b, IsEqualOp op) {
 #ifdef QTS_USE_QUICKJS_NG
   return -1;

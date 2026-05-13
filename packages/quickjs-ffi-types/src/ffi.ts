@@ -173,6 +173,7 @@ export interface QuickJSFFI {
     out_len: UInt32Pointer,
     value: JSValuePointer | JSValueConstPointer,
   ) => number
+  QTS_IsError: (ctx: JSContextPointer, value: JSValuePointer | JSValueConstPointer) => number
   QTS_IsEqual: (
     ctx: JSContextPointer,
     a: JSValuePointer | JSValueConstPointer,
