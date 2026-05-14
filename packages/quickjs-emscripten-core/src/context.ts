@@ -1349,43 +1349,223 @@ export class QuickJSContext
 
   /**
    * Dump a JSValue to Javascript in a best-effort fashion.
-   * If the value is a promise, dumps the promise's state.
-   * Returns `handle.toString()` if it cannot be serialized to JSON.
+   * If the value is a promise, dumps the promise's state..
    */
   dump(handle: QuickJSHandle): any {
-    this.runtime.assertOwned(handle)
-    const type = this.typeof(handle)
+    this.runtime.assertOwned(handle);
+    const type = this.typeof(handle);
     if (type === "string") {
-      return this.getString(handle)
+      return this.getString(handle);
     } else if (type === "number") {
-      return this.getNumber(handle)
+      return this.getNumber(handle);
     } else if (type === "bigint") {
-      return this.getBigInt(handle)
+      return this.getBigInt(handle);
     } else if (type === "undefined") {
-      return undefined
+      return undefined;
+    } else if (type === "boolean") {
+      return this.getNumber(handle) !== 0;
     } else if (type === "symbol") {
-      return this.getSymbol(handle)
+      return this.getSymbol(handle);
+    } else if (type === "function") {
+      // Dup the handle so the wrapper function can outlive this scope.
+      const duppedHandle = this.memory.manage(handle.dup());
+      return (...args: any[]) => {
+        const argHandles = args.map((arg) => this.wrap(arg));
+        const result = this.callFunction(
+          duppedHandle,
+          this.undefined,
+          argHandles,
+        );
+        argHandles.forEach((h) => h.dispose());
+        if (result.error) {
+          const err = this.dump(result.error);
+          result.error.dispose();
+          throw err;
+        }
+        using retHandle = result.value;
+        return this.dump(retHandle);
+      };
     }
 
     // It's confusing if we dump(promise) and just get back {} because promise
     // has no properties, so dump promise state.
-    const asPromiseState = this.getPromiseState(handle)
+    const asPromiseState = this.getPromiseState(handle);
     if (asPromiseState.type === "fulfilled" && !asPromiseState.notAPromise) {
-      handle.dispose()
-      return { type: asPromiseState.type, value: asPromiseState.value.consume(this.dump) }
+      handle.dispose();
+      return {
+        type: asPromiseState.type,
+        value: asPromiseState.value.consume(this.dump),
+      };
     } else if (asPromiseState.type === "pending") {
-      handle.dispose()
-      return { type: asPromiseState.type }
+      handle.dispose();
+      return { type: asPromiseState.type };
     } else if (asPromiseState.type === "rejected") {
-      handle.dispose()
-      return { type: asPromiseState.type, error: asPromiseState.error.consume(this.dump) }
+      handle.dispose();
+      return {
+        type: asPromiseState.type,
+        error: asPromiseState.error.consume(this.dump),
+      };
     }
 
-    const str = this.memory.consumeJSCharPointer(this.ffi.QTS_Dump(this.ctx.value, handle.value))
+    // Recursively deserialize objects and arrays instead of using QTS_Dump +
+    // JSON.parse, which allows dump semantics on nested values.
+    if (type === "object") {
+      // getOwnPropertyNames returns an error for null (mirrors JS behavior:
+      // Object.getOwnPropertyNames(null) throws).
+      using propsResult = this.getOwnPropertyNames(handle);
+      if (propsResult.error) {
+        return null;
+      }
+
+      // Detect arrays via the constructor name — two cheap property reads,
+      // no VM function call needed. Then recursively dump array elements.
+      using ctor = this.getProp(handle, "constructor");
+      using ctorName = this.getProp(ctor, "name");
+      const ctorNameStr = this.getString(ctorName);
+      if (ctorNameStr === "Array") {
+        const len = this.getLength(handle) ?? 0;
+        const arr: any[] = [];
+        for (let i = 0; i < len; i++) {
+          using elem = this.getProp(handle, i);
+          arr.push(this.dump(elem));
+        }
+        return arr;
+      }
+
+      // Recursively dump enumerable own properties
+      using props = propsResult.value;
+      const obj: Record<string, any> = {};
+      const enumerableKeys = new Set<string>();
+      for (const key of props) {
+        const keyStr = this.getString(key);
+        enumerableKeys.add(keyStr);
+        using val = this.getProp(handle, key);
+        obj[keyStr] = this.dump(val);
+      }
+
+      // For Error objects, also extract non-enumerable error properties
+      // (name, message, stack, etc.) that getOwnPropertyNames wouldn't include.
+      const isError = this.ffi.QTS_IsError(this.ctx.value, handle.value) === 1;
+      if (isError) {
+        for (const propName of ["name", "message", "stack", "fileName", "lineNumber"]) {
+          if (!enumerableKeys.has(propName)) {
+            using val = this.getProp(handle, propName);
+            if (this.typeof(val) !== "undefined") {
+              obj[propName] = this.dump(val);
+            }
+          }
+        }
+      }
+
+      return obj;
+    }
+
+    // Fallback for any unrecognised type.
+    const str = this.memory.consumeJSCharPointer(
+      this.ffi.QTS_Dump(this.ctx.value, handle.value),
+    );
     try {
-      return JSON.parse(str)
-    } catch (err) {
-      return str
+      return JSON.parse(str);
+    } catch {
+      return str;
+    }
+  }
+
+  /**
+   * Marshal a JS value to QuickJS. Conceptually the opposite of {@link dump}
+   * @param value any JS value
+   * @returns The correct QuickJSHandle
+   */
+  wrap(value: any): QuickJSHandle {
+    if (value === undefined) {
+      return this.undefined;
+    } else if (value === null) {
+      return this.null;
+    } else if (typeof value === "boolean") {
+      return value ? this.true : this.false;
+    } else if (typeof value === "number") {
+      return this.newNumber(value);
+    } else if (typeof value === "string") {
+      return this.newString(value);
+    } else if (typeof value === "bigint") {
+      return this.newBigInt(value);
+    } else if (typeof value === "symbol") {
+      const key = Symbol.keyFor(value);
+      return key !== undefined ? this.newSymbolFor(key) : this.newUniqueSymbol(value);
+    } else if (typeof value === "object") {
+      if (value instanceof Set) {
+        using setCtor = this.getProp(this.global, "Set");
+        using reflect = this.getProp(this.global, "Reflect");
+        using reflectConstruct = this.getProp(reflect, "construct");
+        using emptyArgs = this.newArray();
+        // No `using` here — ownership transfers to the caller via `return`
+        const vmSetInstance = this
+          .callFunction(reflectConstruct, reflect, setCtor, emptyArgs)
+          .unwrap();
+
+        for (const val of value) {
+          using elemHandle = this.wrap(val);
+          using _addResult = this
+            .callMethod(vmSetInstance, "add", [elemHandle])
+            .unwrap();
+        }
+        return vmSetInstance;
+      }
+
+      if (value instanceof Map) {
+        using mapCtor = this.getProp(this.global, "Map");
+        using reflect = this.getProp(this.global, "Reflect");
+        using reflectConstruct = this.getProp(reflect, "construct");
+        using emptyArgs = this.newArray();
+        // No `using` here — ownership transfers to the caller via `return`
+        const vmMapInstance = this
+          .callFunction(reflectConstruct, reflect, mapCtor, emptyArgs)
+          .unwrap();
+
+        for (const [k, v] of value) {
+          using keyHandle = this.wrap(k);
+          using valHandle = this.wrap(v);
+          using _setResult = this
+            .callMethod(vmMapInstance, "set", [keyHandle, valHandle])
+            .unwrap();
+        }
+        return vmMapInstance;
+      }
+
+      if (value instanceof Date) {
+        using dateCtor = this.getProp(this.global, "Date");
+        using reflect = this.getProp(this.global, "Reflect");
+        using reflectConstruct = this.getProp(reflect, "construct");
+        using argsArray = this.newArray();
+        using timestampHandle = this.newNumber(value.getTime());
+        this.setProp(argsArray, 0, timestampHandle);
+        return this
+          .callFunction(reflectConstruct, reflect, dateCtor, argsArray)
+          .unwrap();
+      }
+
+      if (value instanceof ArrayBuffer) {
+        return this.newArrayBuffer(value);
+      }
+
+      if (Array.isArray(value)) {
+        const arrHandle = this.newArray();
+        value.forEach((elem, index) => {
+          using elemHandle = this.wrap(elem);
+          this.setProp(arrHandle, index, elemHandle);
+        });
+        return arrHandle;
+      }
+
+      // Plain object — recursively wrap enumerable own properties
+      const objHandle = this.newObject();
+      for (const [key, val] of Object.entries(value)) {
+        using propHandle = this.wrap(val);
+        this.setProp(objHandle, key, propHandle);
+      }
+      return objHandle;
+    } else {
+      return this.undefined;
     }
   }
 

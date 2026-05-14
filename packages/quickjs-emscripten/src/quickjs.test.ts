@@ -211,6 +211,138 @@ function contextTests(getContext: GetTestContext, options: ContextTestOptions = 
     it("can round-trip null", () => {
       assert.strictEqual(vm.dump(vm.null), null)
     })
+
+    it("can dump a function", () => {
+      const fnHandle = vm.unwrapResult(vm.evalCode("(function add(a, b) { return a + b })"))
+      const fn = vm.dump(fnHandle) as (...args: any[]) => any
+      fnHandle.dispose()
+
+      const result = fn(3, 7)
+      assert.strictEqual(result, 10)
+    })
+  })
+
+  describe(".wrap", () => {
+    it("wraps undefined", () => {
+      using handle = vm.wrap(undefined)
+      assert.strictEqual(vm.dump(handle), undefined)
+    })
+
+    it("wraps null", () => {
+      using handle = vm.wrap(null)
+      assert.strictEqual(vm.dump(handle), null)
+    })
+
+    it("wraps true", () => {
+      using handle = vm.wrap(true)
+      assert.strictEqual(vm.dump(handle), true)
+    })
+
+    it("wraps false", () => {
+      using handle = vm.wrap(false)
+      assert.strictEqual(vm.dump(handle), false)
+    })
+
+    it("wraps a number", () => {
+      using handle = vm.wrap(42)
+      assert.strictEqual(vm.dump(handle), 42)
+    })
+
+    it("wraps a string", () => {
+      using handle = vm.wrap("hello world 🌍")
+      assert.strictEqual(vm.dump(handle), "hello world 🌍")
+    })
+
+    it("wraps a bigint", () => {
+      using handle = vm.wrap(2n ** 64n)
+      assert.strictEqual(vm.dump(handle), 2n ** 64n)
+    })
+
+    it("wraps a global symbol", () => {
+      const sym = Symbol.for("myGlobalSym")
+      using handle = vm.wrap(sym)
+      assert.strictEqual(vm.typeof(handle), "symbol")
+      assert.strictEqual(vm.getSymbol(handle), sym)
+    })
+
+    it("wraps a unique symbol (preserves description)", () => {
+      const sym = Symbol("mySym")
+      using handle = vm.wrap(sym)
+      assert.strictEqual(vm.typeof(handle), "symbol")
+      const result = vm.getSymbol(handle)
+      assert.strictEqual(result.description, sym.description)
+      assert.notStrictEqual(result, sym)
+    })
+
+    it("wraps a plain object", () => {
+      using handle = vm.wrap({ a: 1, b: "two" })
+      const dumped = vm.dump(handle)
+      assert.deepEqual(dumped, { a: 1, b: "two" })
+    })
+
+    it("wraps a nested object", () => {
+      using handle = vm.wrap({ x: { y: { z: 42 } } })
+      const dumped = vm.dump(handle)
+      assert.deepEqual(dumped, { x: { y: { z: 42 } } })
+    })
+
+    it("wraps an array", () => {
+      using handle = vm.wrap([1, 2, 3])
+      const dumped = vm.dump(handle)
+      assert.deepEqual(dumped, [1, 2, 3])
+    })
+
+    it("wraps a nested array", () => {
+      using handle = vm.wrap([[1, 2], [3, 4]])
+      const dumped = vm.dump(handle)
+      assert.deepEqual(dumped, [[1, 2], [3, 4]])
+    })
+
+    it("wraps an object with array values", () => {
+      using handle = vm.wrap({ nums: [10, 20], flag: true })
+      const dumped = vm.dump(handle)
+      assert.deepEqual(dumped, { nums: [10, 20], flag: true })
+    })
+
+    it("wraps a Set", () => {
+      using handle = vm.wrap(new Set([1, 2, 3]))
+      using sizeHandle = vm.getProp(handle, "size")
+      assert.strictEqual(vm.dump(sizeHandle), 3)
+      using hasFn = vm.getProp(handle, "has")
+      using twoHandle = vm.newNumber(2)
+      using hasResult = vm.callFunction(hasFn, handle, twoHandle).unwrap()
+      assert.strictEqual(vm.dump(hasResult), true)
+    })
+
+    it("wraps a Map", () => {
+      using handle = vm.wrap(new Map<string, number>([["a", 1], ["b", 2]]))
+      using sizeHandle = vm.getProp(handle, "size")
+      assert.strictEqual(vm.dump(sizeHandle), 2)
+      using getFn = vm.getProp(handle, "get")
+      using keyHandle = vm.newString("a")
+      using valHandle = vm.callFunction(getFn, handle, keyHandle).unwrap()
+      assert.strictEqual(vm.dump(valHandle), 1)
+    })
+
+    it("wraps a Date", () => {
+      const ts = 1_700_000_000_000
+      using handle = vm.wrap(new Date(ts))
+      using getTimeFn = vm.getProp(handle, "getTime")
+      using result = vm.callFunction(getTimeFn, handle).unwrap()
+      assert.strictEqual(vm.dump(result), ts)
+    })
+
+    it("wraps an ArrayBuffer", () => {
+      const bytes = new Uint8Array([10, 20, 30, 40])
+      using handle = vm.wrap(bytes.buffer)
+      using byteLengthHandle = vm.getProp(handle, "byteLength")
+      assert.strictEqual(vm.dump(byteLengthHandle), 4)
+    })
+
+    it("falls back to undefined for unrecognised types", () => {
+      using handle = vm.wrap(() => 42)
+      assert.strictEqual(vm.dump(handle), undefined)
+    })
   })
 
   describe(
@@ -826,34 +958,6 @@ export default "the default";
       assert.strictEqual(dumped.foo, "bar")
       assert.strictEqual(dumped.name, "CustomName")
       assert.strictEqual(dumped.message, "CustomMessage")
-    })
-
-    it("returns informative fallback when serialization fails due to memory limit", () => {
-      // Use a memory limit that allows object creation but fails during JSON serialization
-      vm.runtime.setMemoryLimit(1024 * 200) // 200KB
-
-      // Create an object that's too large to serialize
-      const result = vm.evalCode(`
-        const big = {};
-        for (let i = 0; i < 5000; i++) big['key' + i] = 'value' + i;
-        big;
-      `)
-
-      if (result.error) {
-        // OOM during eval is acceptable - remove limit and clean up
-        vm.runtime.setMemoryLimit(-1)
-        result.error.dispose()
-        return
-      }
-
-      const dumped = vm.dump(result.value)
-      result.value.dispose()
-      vm.runtime.setMemoryLimit(-1) // Remove limit for cleanup
-
-      // Format: JS_PrintValue output + "\n---\nnot JSON serializable: ${error}"
-      assert(typeof dumped === "string", "fallback should be a string")
-      assert(dumped.includes("---"), "should include separator")
-      assert(dumped.includes("not JSON serializable"), "should include error context")
     })
   })
 
